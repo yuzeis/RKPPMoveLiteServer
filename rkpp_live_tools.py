@@ -1,21 +1,9 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 花吹雪又一年
 #
-# This file is part of Roco-Kingdom-Protocol-Parser (RKPP).
+# This file is part of Roco-Kingdom-Protocol-Parser-Move-Lite-Server (RMLS).
 # Licensed under the GNU Affero General Public License v3.0 only (AGPL-3.0-only).
-# You must retain the author attribution, this notice, the LICENSE file,
-# and the NOTICE file in redistributions and derivative works.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the LICENSE
-# file for more details.
 
-"""RKPP 单文件嵌入版移动后端。"""
-# pylint: disable=missing-function-docstring,missing-class-docstring
-# pylint: disable=too-many-locals,too-many-instance-attributes,too-few-public-methods
-# pylint: disable=too-many-return-statements,too-many-branches,too-many-statements
-# pylint: disable=too-many-arguments,too-many-positional-arguments
 from __future__ import annotations
 
 import argparse
@@ -41,7 +29,7 @@ try:
 except ImportError as exc:
     raise SystemExit("缺少 pycryptodome。先执行: python -m pip install --user pycryptodome") from exc
 
-from scapy.all import AsyncSniffer, PcapReader  # type: ignore
+from scapy.all import AsyncSniffer, PcapReader, conf, get_if_list  # type: ignore
 from scapy.layers.inet import IP, TCP  # type: ignore
 from scapy.layers.inet6 import IPv6  # type: ignore
 
@@ -69,6 +57,85 @@ _EVENT_FLUSH_INTERVAL_SECONDS = 0.05
 DEFAULT_PORT = 8195
 KEY_FILE = SCRIPT_DIR / "key.txt"
 _KEY_STALE_WARNING_SECONDS = 30 * 60
+
+def _remember_iface(
+    rows: list[tuple[str, str]],
+    seen: set[str],
+    name: str,
+    detail: str = "",
+    aliases: Iterable[str] = (),
+) -> None:
+    name = name.strip()
+    if not name or name in seen:
+        return
+    rows.append((name, detail.strip()))
+    seen.add(name)
+    for alias in aliases:
+        alias = alias.strip()
+        if alias:
+            seen.add(alias)
+
+def available_capture_interfaces() -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    try:
+        for iface in conf.ifaces.values():
+            name = str(getattr(iface, "name", "") or "").strip()
+            description = str(getattr(iface, "description", "") or "").strip()
+            network_name = str(getattr(iface, "network_name", "") or "").strip()
+            display_name = name or network_name or description
+            detail_parts = [
+                part for part in (description, network_name)
+                if part and part != display_name
+            ]
+            detail = " | ".join(dict.fromkeys(detail_parts))
+            _remember_iface(rows, seen, display_name, detail, (description, network_name))
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+    try:
+        for name in get_if_list():
+            _remember_iface(rows, seen, str(name))
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+    return rows
+
+def format_capture_interfaces(rows: list[tuple[str, str]] | None = None) -> str:
+    if rows is None:
+        rows = available_capture_interfaces()
+    if not rows:
+        return "未能读取本机抓包接口；可手动输入 --iface 使用的接口名。"
+
+    lines = ["可用抓包接口（用于 --iface）："]
+    for index, (name, detail) in enumerate(rows, start=1):
+        suffix = f"  {detail}" if detail else ""
+        lines.append(f"  {index}. {name}{suffix}")
+    return "\n".join(lines)
+
+def prompt_iface() -> str:
+    rows = available_capture_interfaces()
+    if rows:
+        print(format_capture_interfaces(rows))
+    else:
+        print("未能读取本机抓包接口；可手动输入 --iface 使用的接口名。")
+
+    default_iface = next((name for name, _ in rows if name == "以太网"), None)
+    if default_iface is None:
+        default_iface = rows[0][0] if rows else "以太网"
+
+    while True:
+        raw = input(f"接口名/序号 [{default_iface}]: ").strip()
+        if not raw:
+            return default_iface
+        if raw.isdecimal():
+            index = int(raw)
+            if 1 <= index <= len(rows):
+                return rows[index - 1][0]
+            print("接口序号超出范围，请重新输入。")
+            continue
+        return raw
 
 def now_text() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -142,19 +209,24 @@ def _sint32(v: int) -> int:
     v &= 0xFFFFFFFF
     return v - 0x100000000 if v & 0x80000000 else v
 
+_TSF4G_MARKER = b"tsf4g"
+_TSF4G_MIN_LEN = 6
+_TSF4G_MAX_LEN = 22  # 协议保证 trailer 总长 N ∈ [6,22]（见 TSF4G.md §6）
+
+def _has_tsf4g_trailer(data: bytes) -> bool:
+    """plaintext 末尾是否为合法 tsf4g trailer: random(N-6) + "tsf4g" + uint8(N)。"""
+    if len(data) < _TSF4G_MIN_LEN:
+        return False
+    n = data[-1]
+    return (
+        _TSF4G_MIN_LEN <= n <= _TSF4G_MAX_LEN
+        and len(data) >= n
+        and data[-6:-1] == _TSF4G_MARKER
+    )
+
 def _tsf4g_padding_len(data: bytes) -> int:
-    """探测 tsf4g 结尾填充长度（末尾 6 字节为 "tsf4g" + pad-len）。"""
-    marker = b"tsf4g"
-    if data.rfind(marker) != len(data) - 6:
-        return 0
-    pad = data[-1]
-    if len(marker) + 1 <= pad <= 64 and len(data) >= pad:
-        return pad
-    if pad == 1:
-        return 1
-    if 0 < pad <= 16 and len(data) >= pad and all(byte == pad for byte in data[-pad:]):
-        return pad
-    return 0
+    """合法 tsf4g trailer → 返回其总长 N，否则 0。真实流量 N 恒为 [6,21]。"""
+    return data[-1] if _has_tsf4g_trailer(data) else 0
 
 MOVE_NOTIFY_OPCODE = 0x0414
 MOVE_BATCH_OPCODE = 0x0413
@@ -328,6 +400,66 @@ def safe_decode_payload(opcode: int, blob: bytes) -> tuple[dict[str, Any] | None
     except Exception as exc:  # pylint: disable=broad-exception-caught
         return None, str(exc)
 
+# ---- 内嵌资源访问（vec/passthrough 缓存一次） ----
+_VEC_PREFIXES: tuple[str, ...] = ()
+_PASSTHROUGH: tuple[str, ...] = ()
+_PASSTHROUGH_FROM_BASE = frozenset({"space_time_ms", "operator_obj_id"})
+
+def _row_cfg_cached() -> None:
+    global _VEC_PREFIXES, _PASSTHROUGH
+    if not _VEC_PREFIXES:
+        _VEC_PREFIXES = tuple(_row_cfg("vec_prefixes"))
+        _PASSTHROUGH = tuple(_row_cfg("relay_passthrough"))
+
+def _vec(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"x": None, "y": None, "z": None}
+    return {axis: value.get(axis) for axis in "xyz"}
+
+def _emit_event(
+    out: list[dict[str, Any]],
+    row_index: int,
+    row: dict[str, Any],
+    action_name: str,
+    event_class: str,
+    content: dict[str, Any],
+    *,
+    base: dict[str, Any] | None = None,
+    batch_index: int | None = None,
+    batch_timestamp: Any = None,
+    act_index: int | None = None,
+    segment_index: int | None = None,
+    summary_text: str = "",
+) -> None:
+    """直接构造对外的移动事件（取代旧的扁平 row + _build_move_events 重打包两层）。"""
+    content = content if isinstance(content, dict) else {}
+    base = base if isinstance(base, dict) else {}
+    event: dict[str, Any] = {
+        "row_index": int(row_index),
+        "captured_at": row.get("captured_at"),
+        "flow_id": row.get("flow_id"),
+        "direction": row.get("direction"),
+        "seq": row.get("seq"),
+        "opcode": row.get("opcode"),
+        "opcode_name": str(row.get("opcode_name") or "").strip(),
+        "event_class": event_class or "move",
+        "action_name": action_name,
+    }
+    for prefix in _VEC_PREFIXES:
+        event[prefix] = _vec(content.get(prefix))
+    event["batch_index"] = batch_index
+    event["batch_timestamp"] = batch_timestamp
+    event["act_index"] = act_index
+    event["segment_index"] = segment_index
+    event["opencode"] = row.get("opcode_hex") or row.get("opcode")
+    event["summary_kind"] = action_name or "move"
+    event["summary_text"] = summary_text
+    for key in _PASSTHROUGH:
+        src = base if key in _PASSTHROUGH_FROM_BASE else content
+        event[key] = src.get(key)
+    event["content"] = content or {}
+    out.append(event)
+
 def _point_pos(value: Any) -> dict[str, Any]:
     if isinstance(value, dict) and isinstance(value.get("pos"), dict):
         return value["pos"]
@@ -345,66 +477,9 @@ def _actor_base(actor: dict[str, Any]) -> dict[str, Any]:
             return branch["base"]
     return {}
 
-def _set_vec_fields(item: dict[str, Any], prefix: str, vec: Any) -> None:
-    if not isinstance(vec, dict):
-        vec = {}
-    for axis in "xyz":
-        item[f"{prefix}_{axis}"] = vec.get(axis)
-
-def _append_move_row(
-    rows: list[dict[str, Any]],
-    *,
-    row_index: int,
-    row: dict[str, Any],
-    batch_index: int | None,
-    batch_timestamp: Any,
-    act_index: int | None,
-    action_name: str,
-    content: dict[str, Any],
-    summary_text: str,
-    event_class: str = "move",
-    base: dict[str, Any] | None = None,
-    segment_index: int | None = None,
-) -> None:
-    base = base if isinstance(base, dict) else {}
-    item: dict[str, Any] = {
-        "row_index": row_index,
-        "batch_index": batch_index,
-        "batch_timestamp": batch_timestamp,
-        "act_index": act_index,
-        "segment_index": segment_index,
-        "captured_at": row.get("captured_at"),
-        "flow_id": row.get("flow_id"),
-        "direction": row.get("direction"),
-        "seq": row.get("seq"),
-        "opcode": row.get("opcode"),
-        "opcode_hex": row.get("opcode_hex"),
-        "opcode_name": row.get("opcode_name"),
-        "event_class": event_class,
-        "action_name": action_name,
-        "space_time_ms": base.get("space_time_ms"),
-        "operator_obj_id": base.get("operator_obj_id"),
-        "actor_id": content.get("actor_id"),
-        "target_actor_id": content.get("target_actor_id"),
-        "platform_actor_id": content.get("platform_actor_id"),
-        "time_stamp": content.get("time_stamp"),
-        "move_mode": content.get("move_mode"),
-        "custom_mode": content.get("custom_mode"),
-        "stop_move": content.get("stop_move"),
-        "ride_move": content.get("ride_move"),
-        "mate_point": content.get("mate_point"),
-        "mate_move_mode": content.get("mate_move_mode"),
-        "status": content.get("status"),
-        "op_code": content.get("op_code"),
-        "sub_status": content.get("sub_status"),
-        "scene_cfg_id": content.get("scene_cfg_id"),
-        "move_id": content.get("move_id"),
-        "summary_text": summary_text,
-        "content": content,
-    }
-    for prefix in _row_cfg("vec_prefixes"):
-        _set_vec_fields(item, prefix, content.get(prefix))
-    rows.append(item)
+def _xyz(d: Any) -> str:
+    d = d if isinstance(d, dict) else {}
+    return f"({d.get('x')},{d.get('y')},{d.get('z')})"
 
 def _iter_client_move_sources(
     record: dict[str, Any],
@@ -426,71 +501,44 @@ def _decoded_record(record: dict[str, Any]) -> dict[str, Any]:
     decoded = record.get("_decoded")
     return decoded if isinstance(decoded, dict) else {}
 
-def _extract_zone_scene_move_req(
-    row_index: int, row: dict[str, Any], record: dict[str, Any], rows: list[dict[str, Any]],
-) -> None:
+# ---- 直接 opcode（c2s 请求/状态）抽取器 ----
+def _extract_zone_scene_move_req(row_index, row, record, out):
     move = _decoded_record(record)
     pos = move.get("to_pos") if isinstance(move.get("to_pos"), dict) else {}
-    _append_move_row(
-        rows, row_index=row_index, row=row, batch_index=None, batch_timestamp=None,
-        act_index=None, action_name="zone_scene_move_req", content=move,
-        event_class="request",
-        summary_text=(
-            f"zone_scene_move_req pos=({pos.get('x')},{pos.get('y')},{pos.get('z')}) "
-            f"mode={move.get('move_mode')}"
-        ),
+    _emit_event(
+        out, row_index, row, "zone_scene_move_req", "request", move,
+        summary_text=f"zone_scene_move_req pos={_xyz(pos)} mode={move.get('move_mode')}",
     )
 
-def _extract_zone_scene_interact_move_req(
-    row_index: int, row: dict[str, Any], record: dict[str, Any], rows: list[dict[str, Any]],
-) -> None:
+def _extract_zone_scene_interact_move_req(row_index, row, record, out):
     move = _decoded_record(record)
     point = move.get("to_point") if isinstance(move.get("to_point"), dict) else {}
     content = {"to_pos": _point_pos(point), "to_rot": _point_dir(point), **move}
-    pos = content.get("to_pos") if isinstance(content.get("to_pos"), dict) else {}
-    _append_move_row(
-        rows, row_index=row_index, row=row, batch_index=None, batch_timestamp=None,
-        act_index=None, action_name="zone_scene_interact_move_req", content=content,
-        event_class="request",
-        summary_text=f"zone_scene_interact_move_req pos=({pos.get('x')},{pos.get('y')},{pos.get('z')})",
+    _emit_event(
+        out, row_index, row, "zone_scene_interact_move_req", "request", content,
+        summary_text=f"zone_scene_interact_move_req pos={_xyz(content.get('to_pos'))}",
     )
 
-def _extract_zone_scene_sync_player_status_req(
-    row_index: int, row: dict[str, Any], record: dict[str, Any], rows: list[dict[str, Any]],
-) -> None:
-    status = _decoded_record(record)
-    _append_move_row(
-        rows, row_index=row_index, row=row, batch_index=None, batch_timestamp=None,
-        act_index=None, action_name="zone_scene_sync_player_status_req", content=status,
-        event_class="status",
-        summary_text=(
-            f"sync_player_status_req status={status.get('status')} "
-            f"op={status.get('op_code')} sub={status.get('sub_status')}"
-        ),
+def _extract_zone_scene_sync_player_status_req(row_index, row, record, out):
+    s = _decoded_record(record)
+    _emit_event(
+        out, row_index, row, "zone_scene_sync_player_status_req", "status", s,
+        summary_text=f"sync_player_status_req status={s.get('status')} op={s.get('op_code')} sub={s.get('sub_status')}",
     )
 
-def _extract_zone_scene_change_move_mode_req(
-    row_index: int, row: dict[str, Any], record: dict[str, Any], rows: list[dict[str, Any]],
-) -> None:
-    status = _decoded_record(record)
-    _append_move_row(
-        rows, row_index=row_index, row=row, batch_index=None, batch_timestamp=None,
-        act_index=None, action_name="zone_scene_change_move_mode_req", content=status,
-        event_class="status",
-        summary_text=f"change_move_mode_req move_id={status.get('move_id')} stamina={status.get('stamina')}",
+def _extract_zone_scene_change_move_mode_req(row_index, row, record, out):
+    s = _decoded_record(record)
+    _emit_event(
+        out, row_index, row, "zone_scene_change_move_mode_req", "status", s,
+        summary_text=f"change_move_mode_req move_id={s.get('move_id')} stamina={s.get('stamina')}",
     )
 
-def _extract_travel_together_sync_req(
-    row_index: int, row: dict[str, Any], record: dict[str, Any], rows: list[dict[str, Any]],
-) -> None:
+def _extract_travel_together_sync_req(row_index, row, record, out):
     sync = _decoded_record(record)
     content = {"to_pos": sync.get("report_pos"), "speed": sync.get("pos_diff"), **sync}
-    pos = content.get("to_pos") if isinstance(content.get("to_pos"), dict) else {}
-    _append_move_row(
-        rows, row_index=row_index, row=row, batch_index=None, batch_timestamp=None,
-        act_index=None, action_name="zone_scene_relation_travel_together_sync_req",
-        content=content, event_class="request",
-        summary_text=f"travel_together_sync_req pos=({pos.get('x')},{pos.get('y')},{pos.get('z')})",
+    _emit_event(
+        out, row_index, row, "zone_scene_relation_travel_together_sync_req", "request", content,
+        summary_text=f"travel_together_sync_req pos={_xyz(content.get('to_pos'))}",
     )
 
 DIRECT_OPCODE_EXTRACTORS = {
@@ -501,68 +549,45 @@ DIRECT_OPCODE_EXTRACTORS = {
     TRAVEL_TOGETHER_SYNC_REQ_OPCODE: _extract_travel_together_sync_req,
 }
 
-def _extract_client_move_action(
-    rows: list[dict[str, Any]], row_index: int, row: dict[str, Any],
-    batch_index: int | None, batch_timestamp: Any, act_index: int,
-    act: dict[str, Any], base: dict[str, Any],
-) -> None:
+# ---- 场景 act 抽取器（共享签名: out,row_index,row,batch_index,batch_timestamp,act_index,act,base） ----
+def _ex_client_move(out, ri, row, bi, bt, ai, act, base):
     move = act.get("client_move")
     if not isinstance(move, dict):
         return
-    pos = move.get("to_pos") if isinstance(move.get("to_pos"), dict) else {}
-    _append_move_row(
-        rows, row_index=row_index, row=row, batch_index=batch_index,
-        batch_timestamp=batch_timestamp, act_index=act_index, action_name="client_move",
-        content=move, base=base, event_class="client_move",
-        summary_text=(
-            f"client_move actor={move.get('actor_id')} "
-            f"pos=({pos.get('x')},{pos.get('y')},{pos.get('z')}) "
-            f"mode={move.get('move_mode')}"
-        ),
+    _emit_event(
+        out, ri, row, "client_move", "client_move", move, base=base,
+        batch_index=bi, batch_timestamp=bt, act_index=ai,
+        summary_text=f"client_move actor={move.get('actor_id')} pos={_xyz(move.get('to_pos'))} mode={move.get('move_mode')}",
     )
 
-def _extract_server_move_action(
-    rows: list[dict[str, Any]], row_index: int, row: dict[str, Any],
-    batch_index: int | None, batch_timestamp: Any, act_index: int,
-    act: dict[str, Any], base: dict[str, Any],
-) -> None:
-    server_move = act.get("server_move")
-    if not isinstance(server_move, dict):
+def _ex_server_move(out, ri, row, bi, bt, ai, act, base):
+    sm = act.get("server_move")
+    if not isinstance(sm, dict):
         return
-    positions = server_move.get("to_pos_list") or []
-    times = server_move.get("to_time_list") or []
-    dirs = server_move.get("to_dir_list") or []
+    positions = sm.get("to_pos_list") or []
+    times = sm.get("to_time_list") or []
+    dirs = sm.get("to_dir_list") or []
     if isinstance(positions, list) and positions:
-        for segment_index, pos in enumerate(positions):
-            content = dict(server_move)
+        for si, pos in enumerate(positions):
+            content = dict(sm)
             content["to_pos"] = pos if isinstance(pos, dict) else {}
-            if segment_index < len(times):
-                content["time_stamp"] = times[segment_index]
-            if segment_index < len(dirs):
-                content["custom_mode"] = dirs[segment_index]
-            _append_move_row(
-                rows, row_index=row_index, row=row, batch_index=batch_index,
-                batch_timestamp=batch_timestamp, act_index=act_index,
-                segment_index=segment_index, action_name="server_move",
-                content=content, base=base, event_class="server_move",
-                summary_text=(
-                    f"server_move actor={server_move.get('actor_id')} "
-                    f"segment={segment_index} mode={server_move.get('move_mode')}"
-                ),
+            if si < len(times):
+                content["time_stamp"] = times[si]
+            if si < len(dirs):
+                content["custom_mode"] = dirs[si]
+            _emit_event(
+                out, ri, row, "server_move", "server_move", content, base=base,
+                batch_index=bi, batch_timestamp=bt, act_index=ai, segment_index=si,
+                summary_text=f"server_move actor={sm.get('actor_id')} segment={si} mode={sm.get('move_mode')}",
             )
         return
-    _append_move_row(
-        rows, row_index=row_index, row=row, batch_index=batch_index,
-        batch_timestamp=batch_timestamp, act_index=act_index, action_name="server_move",
-        content=server_move, base=base, event_class="server_move",
-        summary_text=f"server_move actor={server_move.get('actor_id')}",
+    _emit_event(
+        out, ri, row, "server_move", "server_move", sm, base=base,
+        batch_index=bi, batch_timestamp=bt, act_index=ai,
+        summary_text=f"server_move actor={sm.get('actor_id')}",
     )
 
-def _extract_configured_simple_actions(
-    rows: list[dict[str, Any]], row_index: int, row: dict[str, Any],
-    batch_index: int | None, batch_timestamp: Any, act_index: int,
-    act: dict[str, Any], base: dict[str, Any],
-) -> None:
+def _ex_simple_actions(out, ri, row, bi, bt, ai, act, base):
     for key, pos_key, rot_key in _row_cfg("simple_actions"):
         content = act.get(key)
         if not isinstance(content, dict):
@@ -572,141 +597,103 @@ def _extract_configured_simple_actions(
             payload["to_pos"] = content.get(pos_key)
         if rot_key:
             payload["to_rot"] = content.get(rot_key)
-        _append_move_row(
-            rows, row_index=row_index, row=row, batch_index=batch_index,
-            batch_timestamp=batch_timestamp, act_index=act_index, action_name=key,
-            content=payload, base=base, event_class="scene_action",
+        _emit_event(
+            out, ri, row, key, "scene_action", payload, base=base,
+            batch_index=bi, batch_timestamp=bt, act_index=ai,
             summary_text=f"{key} actor={content.get('actor_id')}",
         )
 
-def _extract_configured_point_actions(
-    rows: list[dict[str, Any]], row_index: int, row: dict[str, Any],
-    batch_index: int | None, batch_timestamp: Any, act_index: int,
-    act: dict[str, Any], base: dict[str, Any],
-) -> None:
+def _ex_point_actions(out, ri, row, bi, bt, ai, act, base):
     for key, point_key in _row_cfg("point_actions"):
         content = act.get(key)
         if not isinstance(content, dict):
             continue
         point = content.get(point_key) if isinstance(content.get(point_key), dict) else {}
         payload = {"to_pos": _point_pos(point), "to_rot": _point_dir(point), **content}
-        _append_move_row(
-            rows, row_index=row_index, row=row, batch_index=batch_index,
-            batch_timestamp=batch_timestamp, act_index=act_index, action_name=key,
-            content=payload, base=base, event_class="scene_action",
+        _emit_event(
+            out, ri, row, key, "scene_action", payload, base=base,
+            batch_index=bi, batch_timestamp=bt, act_index=ai,
             summary_text=f"{key} actor={content.get('actor_id')}",
         )
 
-def _extract_actor_enter_action(
-    rows: list[dict[str, Any]], row_index: int, row: dict[str, Any],
-    batch_index: int | None, batch_timestamp: Any, act_index: int,
-    act: dict[str, Any], base: dict[str, Any],
-) -> None:
+def _ex_actor_enter(out, ri, row, bi, bt, ai, act, base):
     actor_enter = act.get("actor_enter")
     if not isinstance(actor_enter, dict):
         return
-    for segment_index, actor in enumerate(actor_enter.get("actors") or []):
+    for si, actor in enumerate(actor_enter.get("actors") or []):
         if not isinstance(actor, dict):
             continue
-        base_info = _actor_base(actor)
-        pt = base_info.get("pt") if isinstance(base_info.get("pt"), dict) else {}
+        info = _actor_base(actor)
+        pt = info.get("pt") if isinstance(info.get("pt"), dict) else {}
         payload = {
-            "actor_id": base_info.get("actor_id"),
-            "target_actor_id": base_info.get("logic_id"),
-            "platform_actor_id": base_info.get("platform_actor_id"),
+            "actor_id": info.get("actor_id"),
+            "target_actor_id": info.get("logic_id"),
+            "platform_actor_id": info.get("platform_actor_id"),
             "to_pos": _point_pos(pt),
             "to_rot": _point_dir(pt),
-            **base_info,
+            **info,
         }
-        _append_move_row(
-            rows, row_index=row_index, row=row, batch_index=batch_index,
-            batch_timestamp=batch_timestamp, act_index=act_index,
-            segment_index=segment_index, action_name="actor_enter",
-            content=payload, base=base, event_class="scene_actor",
-            summary_text=f"actor_enter actor={base_info.get('actor_id')}",
+        _emit_event(
+            out, ri, row, "actor_enter", "scene_actor", payload, base=base,
+            batch_index=bi, batch_timestamp=bt, act_index=ai, segment_index=si,
+            summary_text=f"actor_enter actor={info.get('actor_id')}",
         )
 
-def _extract_actor_leave_action(
-    rows: list[dict[str, Any]], row_index: int, row: dict[str, Any],
-    batch_index: int | None, batch_timestamp: Any, act_index: int,
-    act: dict[str, Any], base: dict[str, Any],
-) -> None:
+def _ex_actor_leave(out, ri, row, bi, bt, ai, act, base):
     actor_leave = act.get("actor_leave")
     if not isinstance(actor_leave, dict):
         return
-    for segment_index, actor_id in enumerate(actor_leave.get("actor_ids") or []):
-        _append_move_row(
-            rows, row_index=row_index, row=row, batch_index=batch_index,
-            batch_timestamp=batch_timestamp, act_index=act_index,
-            segment_index=segment_index, action_name="actor_leave",
-            content={"actor_id": actor_id}, base=base, event_class="scene_actor",
+    for si, actor_id in enumerate(actor_leave.get("actor_ids") or []):
+        _emit_event(
+            out, ri, row, "actor_leave", "scene_actor", {"actor_id": actor_id}, base=base,
+            batch_index=bi, batch_timestamp=bt, act_index=ai, segment_index=si,
             summary_text=f"actor_leave actor={actor_id}",
         )
 
-def _extract_actor_num_action(
-    rows: list[dict[str, Any]], row_index: int, row: dict[str, Any],
-    batch_index: int | None, batch_timestamp: Any, act_index: int,
-    act: dict[str, Any], base: dict[str, Any],
-) -> None:
+def _ex_actor_num(out, ri, row, bi, bt, ai, act, base):
     actor_num = act.get("actor_num")
     if not isinstance(actor_num, dict):
         return
     payload = {"to_pos": actor_num.get("pos"), **actor_num}
-    _append_move_row(
-        rows, row_index=row_index, row=row, batch_index=batch_index,
-        batch_timestamp=batch_timestamp, act_index=act_index, action_name="actor_num",
-        content=payload, base=base, event_class="scene_actor",
-        summary_text=(
-            f"actor_num total={actor_num.get('total_num')} "
-            f"view={actor_num.get('view_num')}"
-        ),
+    _emit_event(
+        out, ri, row, "actor_num", "scene_actor", payload, base=base,
+        batch_index=bi, batch_timestamp=bt, act_index=ai,
+        summary_text=f"actor_num total={actor_num.get('total_num')} view={actor_num.get('view_num')}",
     )
 
-def _extract_configured_status_actions(
-    rows: list[dict[str, Any]], row_index: int, row: dict[str, Any],
-    batch_index: int | None, batch_timestamp: Any, act_index: int,
-    act: dict[str, Any], base: dict[str, Any],
-) -> None:
+def _ex_status_actions(out, ri, row, bi, bt, ai, act, base):
     for key, action_name in _row_cfg("status_actions"):
         content = act.get(key)
         if not isinstance(content, dict):
             continue
-        _append_move_row(
-            rows, row_index=row_index, row=row, batch_index=batch_index,
-            batch_timestamp=batch_timestamp, act_index=act_index,
-            action_name=action_name, content=content, base=base, event_class="status",
+        _emit_event(
+            out, ri, row, action_name, "status", content, base=base,
+            batch_index=bi, batch_timestamp=bt, act_index=ai,
             summary_text=f"{action_name} actor={content.get('actor_id')}",
         )
 
 SCENE_ACT_EXTRACTORS = (
-    _extract_client_move_action,
-    _extract_server_move_action,
-    _extract_configured_simple_actions,
-    _extract_configured_point_actions,
-    _extract_actor_enter_action,
-    _extract_actor_leave_action,
-    _extract_actor_num_action,
-    _extract_configured_status_actions,
+    _ex_client_move, _ex_server_move, _ex_simple_actions, _ex_point_actions,
+    _ex_actor_enter, _ex_actor_leave, _ex_actor_num, _ex_status_actions,
 )
 
-def build_client_move_rows(
-    row_index: int,
-    row: dict[str, Any],
-    parsed_info: dict[str, Any],
+def build_move_events(
+    row_index: int, row: dict[str, Any], parsed_info: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """把一条解码后的 record 展开成多条移动相关行，供 CSV / HTTP 使用。"""
+    """把一条解码后的 record 展开成多条对外移动事件。"""
     record = parsed_info.get("record") if isinstance(parsed_info, dict) else None
     if not isinstance(record, dict):
         return []
-    if int(record.get("opcode", 0) or 0) not in MOVE_OPCODES:
-        return []
-    rows: list[dict[str, Any]] = []
     opcode = int(record.get("opcode", 0) or 0)
+    if opcode not in MOVE_OPCODES:
+        return []
+    _row_cfg_cached()
+    out: list[dict[str, Any]] = []
 
-    direct_extractor = DIRECT_OPCODE_EXTRACTORS.get(opcode)
-    if direct_extractor is not None:
-        direct_extractor(row_index, row, record, rows)
-        return rows
+    direct = DIRECT_OPCODE_EXTRACTORS.get(opcode)
+    if direct is not None:
+        direct(row_index, row, record, out)
+        return out
 
     for batch_index, batch_timestamp, decoded in _iter_client_move_sources(record):
         acts = decoded.get("acts")
@@ -717,8 +704,8 @@ def build_client_move_rows(
             if not isinstance(act, dict):
                 continue
             for extractor in SCENE_ACT_EXTRACTORS:
-                extractor(rows, row_index, row, batch_index, batch_timestamp, act_index, act, base)
-    return rows
+                extractor(out, row_index, row, batch_index, batch_timestamp, act_index, act, base)
+    return out
 
 def parse_key_text(text: str) -> bytes:
     raw = text.strip()
@@ -835,11 +822,8 @@ def flow_key_from_packet(packet, port: int) -> tuple[str, str, int, str, int, st
 @dataclass
 class Be21Packet:
     direction: str
-    stream_offset: int
     cmd: int
     seq: int
-    hdr_len: int
-    body_len: int
     header_extra: bytes
     body: bytes
 
@@ -880,11 +864,8 @@ def parse_be21_from_buffer(
         packets.append(
             Be21Packet(
                 direction=direction,
-                stream_offset=off,
                 cmd=cmd,
                 seq=seq,
-                hdr_len=hdr_len,
-                body_len=body_len,
                 header_extra=bytes(data[off + FIXED_HDR_LEN:off + hdr_len]),
                 body=bytes(data[off + hdr_len:off + pkt_len]),
             )
@@ -898,7 +879,6 @@ class DirectionState:
     direction: str
     buffer: bytearray = field(default_factory=bytearray)
     parse_offset: int = 0
-    stream_base: int = 0
     _base_seq: int | None = None
     _next_contig_seq: int | None = None
     _pending: dict[int, bytes] = field(default_factory=dict)
@@ -918,16 +898,12 @@ class DirectionState:
         if len(self.buffer) > _MAX_BUFFER_SIZE:
             self._trim_buffer()
 
-        base = self.stream_base
         packets, new_off = parse_be21_from_buffer(self.buffer, self.direction, self.parse_offset)
         self.parse_offset = new_off
-        for packet in packets:
-            packet.stream_offset += base
 
         if self.parse_offset >= 0x10000 and self.parse_offset > len(self.buffer) // 2:
             trim = self.parse_offset
             del self.buffer[:trim]
-            self.stream_base += trim
             if self._base_seq is not None:
                 self._base_seq += trim
             self.parse_offset = 0
@@ -951,7 +927,6 @@ class DirectionState:
                 self.buffer = bytearray(payload[:prepend_len]) + self.buffer
                 self._base_seq = seq
                 self.parse_offset += prepend_len
-                self.stream_base = max(0, self.stream_base - prepend_len)
             if end <= self._next_contig_seq:
                 return
             payload = payload[self._next_contig_seq - seq:]
@@ -1055,7 +1030,6 @@ class DirectionState:
         if trim <= 0:
             return
         del self.buffer[:trim]
-        self.stream_base += trim
         self.parse_offset = max(0, self.parse_offset - trim)
         if self._base_seq is not None:
             self._base_seq += trim
@@ -1096,7 +1070,10 @@ def normalize_c2s_opcode(raw_opcode: int) -> tuple[int, bool]:
     return raw_opcode, False
 
 def parse_live_c2s_record(plain: bytes, seq: int) -> dict[str, Any] | None:
-    if len(plain) < 14 or plain[8:10] != b"\x39\x63":
+    # 旧版用固定魔数 plain[8:10]==0x3963 作硬闸，但真实抓包该位置随会话变化
+    # (实测 7ca2/0000/fae2…)，导致 100% c2s 记录被丢。改用 tsf4g trailer + opcode
+    # 结构双重校验：既能容纳变化的 stream 标记，又能拒绝垃圾。
+    if len(plain) < 14 or not _has_tsf4g_trailer(plain):
         return None
     prefix_u32 = int.from_bytes(plain[0:4], "big")
     raw_opcode = int.from_bytes(plain[4:8], "big")
@@ -1114,6 +1091,7 @@ def parse_live_c2s_record(plain: bytes, seq: int) -> dict[str, Any] | None:
         "raw_opcode_hex": f"0x{raw_opcode:08X}",
         "opcode_normalized": normalized,
         "prefix_u32": prefix_u32,
+        "stream_tag": plain[8:10].hex(),  # 旧 0x3963 位置；随会话变化，仅作调试线索
         "req_seq": req_seq,
         "raw_payload": plain[14:],
     }
@@ -1130,10 +1108,11 @@ class OpcodeRelayServer:
         self.host = host
         self.port = port
         self.logger = session_logger
-        self._history: deque[dict[str, Any]] = deque(maxlen=max(1, history_size))
-        self._clients: set[queue.Queue[dict[str, Any] | None]] = set()
+        self._history: deque[tuple[int, dict[str, Any]]] = deque(maxlen=max(1, history_size))
+        self._clients: set[queue.Queue[tuple[int, dict[str, Any]] | None]] = set()
         self._lock = threading.Lock()
         self._event_count = 0
+        self._next_seq = 0
         self._dropped_client_events = 0
         self._runtime_stats_provider: Callable[[], dict[str, Any]] | None = None
         self._requested_port = port
@@ -1173,12 +1152,16 @@ class OpcodeRelayServer:
             return
         with self._lock:
             self._event_count += len(events)
+            seq_items: list[tuple[int, dict[str, Any]]] = []
             for event in events:
-                self._history.append(event)
+                self._next_seq += 1
+                pair = (self._next_seq, event)
+                self._history.append(pair)
+                seq_items.append(pair)
             clients = list(self._clients)
-        for event in events:
+        for pair in seq_items:
             for client in clients:
-                self._push_client(client, event)
+                self._push_client(client, pair)
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
@@ -1200,21 +1183,29 @@ class OpcodeRelayServer:
             return []
         with self._lock:
             items = list(self._history)
+        return [event for _seq, event in items[-limit:]]
+
+    def _snapshot(self, limit: int = 50) -> list[tuple[int, dict[str, Any]]]:
+        if limit <= 0:
+            return []
+        with self._lock:
+            items = list(self._history)
         return items[-limit:]
 
-    def subscribe(self) -> queue.Queue[dict[str, Any] | None]:
-        client: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=1000)
+    def subscribe(self) -> queue.Queue[tuple[int, dict[str, Any]] | None]:
+        client: queue.Queue[tuple[int, dict[str, Any]] | None] = queue.Queue(maxsize=1000)
         with self._lock:
             self._clients.add(client)
         return client
 
-    def unsubscribe(self, client: queue.Queue[dict[str, Any] | None]) -> None:
+    def unsubscribe(self, client: queue.Queue[tuple[int, dict[str, Any]] | None]) -> None:
         with self._lock:
             self._clients.discard(client)
 
     def _push_client(
         self,
-        client: queue.Queue[dict[str, Any] | None], item: dict[str, Any] | None,
+        client: queue.Queue[tuple[int, dict[str, Any]] | None],
+        item: tuple[int, dict[str, Any]] | None,
     ) -> None:
         try:
             client.put_nowait(item)
@@ -1240,34 +1231,7 @@ class OpcodeRelayServer:
         row: dict[str, Any],
         parsed_info: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        events: list[dict[str, Any]] = []
-        passthrough = _row_cfg("relay_passthrough")
-        for item in build_client_move_rows(row_index, row, parsed_info):
-            event: dict[str, Any] = {
-                "row_index": int(item.get("row_index") or row_index),
-                "captured_at": item.get("captured_at"),
-                "flow_id": item.get("flow_id"),
-                "direction": item.get("direction"),
-                "seq": item.get("seq"),
-                "opcode": item.get("opcode"),
-                "opcode_name": str(item.get("opcode_name") or "").strip(),
-                "event_class": item.get("event_class") or "move",
-                "action_name": item.get("action_name"),
-            }
-            for prefix in _row_cfg("vec_prefixes"):
-                event[prefix] = {axis: item.get(f"{prefix}_{axis}") for axis in "xyz"}
-            event["batch_index"] = item.get("batch_index")
-            event["batch_timestamp"] = item.get("batch_timestamp")
-            event["act_index"] = item.get("act_index")
-            event["segment_index"] = item.get("segment_index")
-            event["opencode"] = item.get("opcode_hex") or item.get("opcode")
-            event["summary_kind"] = item.get("action_name") or "move"
-            event["summary_text"] = item.get("summary_text")
-            for key in passthrough:
-                event[key] = item.get(key)
-            event["content"] = item.get("content") or {}
-            events.append(event)
-        return events
+        return build_move_events(row_index, row, parsed_info)
 
     def _make_server_with_fallback(self) -> ThreadingHTTPServer:
         last_exc: OSError | None = None
@@ -1327,9 +1291,11 @@ class OpcodeRelayServer:
                 self.end_headers()
                 pending_flush = 0
                 last_flush = time.monotonic()
+                replayed_seq = 0
                 try:
-                    for item in relay.latest(50):
-                        self._write_event(item)
+                    for seq, event in relay._snapshot(50):
+                        replayed_seq = seq
+                        self._write_event(event)
                         pending_flush += 1
                         if pending_flush >= _EVENT_FLUSH_BATCH_SIZE:
                             self.wfile.flush()
@@ -1343,7 +1309,10 @@ class OpcodeRelayServer:
                         item = client.get()
                         if item is None:
                             break
-                        self._write_event(item)
+                        seq, event = item
+                        if seq <= replayed_seq:
+                            continue  # 已在历史回放阶段发送，避免重复推送
+                        self._write_event(event)
                         pending_flush += 1
                         now = time.monotonic()
                         if (
@@ -1437,7 +1406,7 @@ class RkppAnalyzer:
             return
         flow_info = flow_key_from_packet(packet, self.port)
         if flow_info is None:
-            return  # c2s 方向直接丢
+            return  # 无可识别 IP 层（非 s2c/c2s 端口对），跳过
         client_ip, direction, client_port, server_ip, server_port, flow_text = flow_info
         flow_key = (client_ip, client_port, server_ip, server_port)
         flow = self.flows.get(flow_key)
@@ -1447,11 +1416,11 @@ class RkppAnalyzer:
                 client_ip=client_ip, client_port=client_port,
                 server_ip=server_ip, server_port=server_port,
                 last_seen=now,
-                key=self.current_key,
+                key=self.preset_key,  # 仅继承不可变预置 Key；不继承其它 flow 学到的 current_key
             )
             self.flows[flow_key] = flow
             self.session_logger.log(f"[flow] new flow={flow.flow_id}")
-            if self.current_key:
+            if self.preset_key:
                 self.session_logger.log(
                     f"[key] preset key active flow={flow.flow_id} "
                     f"mode={RKPP_IVDECODER_MODE}"
@@ -1516,18 +1485,14 @@ class RkppAnalyzer:
             return  # 已注册 opcode 之外的帧我们不关心
         record["_decoded"] = decoded
 
-        t = float(packet.time) if hasattr(packet, "time") else None
         row = {
             "captured_at": now_text(),
-            "frame_no": frame_no or "",
-            "packet_time": f"{t:.6f}" if t is not None else "",
             "flow_id": flow.flow_id,
             "direction": be21.direction,
             "seq": be21.seq,
             "opcode": record["opcode"],
             "opcode_hex": record["opcode_hex"],
             "opcode_name": record["opcode_name"],
-            "decrypt_mode": RKPP_IVDECODER_MODE,
         }
 
         row_index = self.decoded_rows
@@ -1571,8 +1536,18 @@ def _run_session(analyzer: RkppAnalyzer, args: argparse.Namespace) -> None:
         except Exception:  # pylint: disable=broad-exception-caught
             pass
 
+def _verify_opcode_consistency(session_logger: SessionLogger) -> None:
+    """Python 侧 opcode 常量与压缩块 opcodes 是双份事实来源，启动时强制对齐。"""
+    asset_ops = {int(k) for k in _schema_opcodes()}
+    if asset_ops != set(MOVE_OPCODES):
+        session_logger.log(
+            "[config_error] MOVE_OPCODES 与内嵌 opcodes 不一致 "
+            f"(仅常量={sorted(set(MOVE_OPCODES)-asset_ops)} 仅资源={sorted(asset_ops-set(MOVE_OPCODES))})"
+        )
+
 def run_command(args: argparse.Namespace) -> int:
     session_logger = SessionLogger()
+    _verify_opcode_consistency(session_logger)
     relay: OpcodeRelayServer | None = None
     key_file = KEY_FILE
     preset_key_source = ""
@@ -1658,7 +1633,7 @@ def run_command(args: argparse.Namespace) -> int:
                 resource.close()
 
 def build_interactive_args() -> argparse.Namespace:
-    iface = input("接口名 [以太网]: ").strip() or "以太网"
+    iface = prompt_iface()
 
     key: str | None = None
     key_info = load_key_info(KEY_FILE)
@@ -1688,9 +1663,11 @@ def build_interactive_args() -> argparse.Namespace:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="RKPP 移动后端：抓 key + 解密 0x4013 + 推送 0x0413/0x0414 移动事件"
+        description="RKPP 移动后端：抓 key + 解密 0x4013 + 推送 0x0413/0x0414 移动事件",
+        epilog=format_capture_interfaces(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--iface")
+    parser.add_argument("--iface", help="抓包网卡名；无参数启动时可直接从接口列表选序号")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--read-pcap", type=Path)
     parser.add_argument("--no-bpf", action="store_true")
